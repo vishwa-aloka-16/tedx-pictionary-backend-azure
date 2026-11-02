@@ -1,0 +1,2 @@
+# Azure/Oryx and repository-root installs use the same complete runtime lock.
+-r backend/requirements.txt

@@ -1,0 +1,10 @@
+# Direct runtime dependencies. requirements.txt locks the complete dependency tree.
+# Regenerate only from a deliberately tested environment; see DEPLOYMENT.md.
+fastapi
+uvicorn[standard]
+numpy
+pillow
+tensorflow
+pydantic
+python-dotenv
+qrcode[pil]
