@@ -5,13 +5,15 @@ import math
 import random
 import secrets
 import sqlite3
+import logging
 import time
 from dataclasses import (
     dataclass,
     field,
 )
 from typing import Any
-from .config import LEADERBOARD_PATH
+from .config import LEADERBOARD_PATH, ARTWORK_SHARE_URL, ARTWORK_SHARE_UPLOAD_KEY
+from .leaderboard_gateway import LeaderboardGateway, LeaderboardUnavailable
 from .difficulty import LEVELS, default_difficulties, round_difficulty
 from .artwork import ArtworkStore
 
@@ -135,6 +137,7 @@ class Game:
 
     transition_token: int = 0
     leaderboard_recorded: bool = False
+    leaderboard_save_status: str = "not_saved"
     global_rankings: dict[str, dict] = field(default_factory=dict)
     round_winners: list[dict[str, Any]] = field(
         default_factory=list
@@ -247,6 +250,48 @@ class GameManager:
                 "SELECT player_name FROM leaderboard WHERE player_name NOT IN (SELECT player_name FROM player_profiles)"
             ).fetchall():
                 self.assign_emoji(connection, name)
+        self.leaderboard_gateway = (LeaderboardGateway(ARTWORK_SHARE_URL, ARTWORK_SHARE_UPLOAD_KEY, self.leaderboard_path)
+                                    if ARTWORK_SHARE_URL else None)
+
+    async def prepare_entry(self):
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if gateway:
+            await asyncio.to_thread(gateway.prepare)
+        return {"status": "ok"}
+
+    def apply_dashboard_reset(self):
+        self.round_drawings.clear()
+        self.artworks.clear()
+        self.dashboard_reset_at = time.time()
+
+    async def deliver_leaderboard(self):
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if not gateway:
+            return
+        try:
+            events = await asyncio.to_thread(gateway.flush)
+        except (LeaderboardUnavailable, sqlite3.Error, OSError, ValueError, KeyError) as error:
+            logging.getLogger(__name__).warning('Leaderboard delivery delayed (%s).', type(error).__name__)
+            return
+        for event in events:
+            if event['type'] == 'saved' and event.get('generation') != gateway.generation:
+                event = {**event, 'type': 'discarded', 'rankings': []}
+            if event['type'] == 'reset':
+                self.apply_dashboard_reset()
+            for game in list(self.games.values()):
+                if game.artwork_id == event.get('completion_id'):
+                    game.leaderboard_save_status = 'saved' if event['type'] == 'saved' else 'reset'
+                    rankings = {p['name']: p for p in event.get('rankings', [])}
+                    game.global_rankings = {p.id: rankings[p.name] for p in game.players.values() if p.name in rankings}
+                    await self.broadcast(game)
+            for queue in self.leaderboard_subscribers:
+                if not queue.full():
+                    queue.put_nowait(True)
+
+    async def leaderboard_delivery_loop(self):
+        while True:
+            await self.deliver_leaderboard()
+            await asyncio.sleep(2)
 
     @staticmethod
     def unused_emoji(connection):
@@ -266,12 +311,22 @@ class GameManager:
         return connection.execute("SELECT emoji FROM player_profiles WHERE player_name = ?", (name,)).fetchone()[0]
 
     def player_emoji(self, name):
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if gateway:
+            return gateway.profile(name)
         with closing(sqlite3.connect(self.leaderboard_path)) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             return self.assign_emoji(connection, name)
 
     def record_leaderboard(self, game: Game):
         if game.leaderboard_recorded:
+            return
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if gateway:
+            gateway.enqueue(game.artwork_id, list(game.players.values()))
+            game.leaderboard_recorded = True
+            game.leaderboard_save_status = 'pending'
+            game.global_rankings = {}
             return
 
         with closing(sqlite3.connect(self.leaderboard_path)) as connection, connection:
@@ -310,8 +365,12 @@ class GameManager:
                 for player in game.players.values()
             }
         game.leaderboard_recorded = True
+        game.leaderboard_save_status = 'saved'
 
     def leaderboard_rows(self):
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if gateway:
+            return gateway.rows()
         with closing(sqlite3.connect(self.leaderboard_path)) as connection, connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
@@ -419,6 +478,7 @@ class GameManager:
             "tied": len(winners) > 1,
             "artwork_id": game.artwork_id,
             "global_rankings": game.global_rankings,
+            "leaderboard_save_status": game.leaderboard_save_status,
             "players": [{"id": player.id, "name": player.name, "score": player.score, "emoji": player.emoji}
                         for player in sorted(game.players.values(), key=lambda player: player.seat)],
             "rounds": [{"round": result["round"], "winner": result["winner"],
@@ -430,6 +490,11 @@ class GameManager:
         }
 
     def reset_dashboard(self) -> dict[str, Any]:
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if gateway:
+            gateway.reset()
+            self.apply_dashboard_reset()
+            return self.leaderboard()
         self.round_drawings.clear()
         self.artworks.clear()
         with closing(sqlite3.connect(self.leaderboard_path)) as connection, connection:
@@ -636,6 +701,7 @@ class GameManager:
             "cosmetic_draw_ends_at": game.round_winners[-1]["reveal_after"] if game.phase == "ROUND_RESULT" and game.round_winners else None,
             "artwork_id": game.artwork_id if game.phase == "FINAL_RESULT" else None,
             "global_rankings": game.global_rankings if game.phase == "FINAL_RESULT" else {},
+            "leaderboard_save_status": game.leaderboard_save_status,
             "round_event_id": game.round_winners[-1]["event_id"] if game.phase == "ROUND_RESULT" and game.round_winners else None,
             "snapshot_seq": time.monotonic_ns(),
             "server_time": time.time(),
@@ -904,7 +970,11 @@ class GameManager:
         self.prune_queue()
         while self.waiting_queue and self.occupied_seats() < MAX_PLAYERS:
             key, entry = next(iter(self.waiting_queue.items()))
-            game, player = await self.seat_player_locked(entry.name, entry.model_key, entry.client_id)
+            try:
+                game, player = await self.seat_player_locked(entry.name, entry.model_key, entry.client_id)
+            except LeaderboardUnavailable:
+                # Releasing an old seat must succeed even if storage is offline.
+                return
             self.waiting_queue.pop(key, None)
             self.queue_assignments[key] = (game.id, player.id)
 
@@ -927,6 +997,9 @@ class GameManager:
                     return None, entry
                 if entry.name.casefold() == player_name.casefold():
                     raise HTTPException(409, "This username is already waiting in the queue.")
+            if getattr(self, 'leaderboard_gateway', None):
+                # Resolve once at entry, so later queue promotion uses its cache.
+                await asyncio.to_thread(self.player_emoji, player_name)
             await self.promote_queue_locked()
             if self.occupied_seats() >= MAX_PLAYERS or self.waiting_queue:
                 if len(self.waiting_queue) >= MAX_QUEUE_SIZE:
@@ -967,7 +1040,7 @@ class GameManager:
         if self.occupied_seats() >= MAX_PLAYERS:
             raise HTTPException(409, "Game in progress\u2014please wait.")
         waiting_game = None
-        emoji = self.player_emoji(player_name)
+        emoji = await asyncio.to_thread(self.player_emoji, player_name)
 
         for existing_game in (
             self.games.values()
@@ -1653,6 +1726,8 @@ class GameManager:
             game.previous_prompt = ""
             game.used_prompts.clear()
             game.leaderboard_recorded = False
+            game.leaderboard_save_status = 'not_saved'
+            game.global_rankings = {}
 
             game.countdown_ends_at = None
             game.round_started_at = None
@@ -1794,6 +1869,7 @@ class GameManager:
                 game.used_prompts.clear()
                 game.round_winners = []
                 game.leaderboard_recorded = False
+                game.leaderboard_save_status = 'not_saved'
 
                 game.countdown_ends_at = None
                 game.round_started_at = None

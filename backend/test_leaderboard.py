@@ -9,6 +9,9 @@ from backend.game_manager import GameManager, Game, Player, PLAYER_EMOJIS
 
 class LeaderboardHighScoreTests(unittest.TestCase):
     def setUp(self):
+        remote = patch('backend.game_manager.ARTWORK_SHARE_URL', '')
+        remote.start()
+        self.addCleanup(remote.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.manager = GameManager.__new__(GameManager)

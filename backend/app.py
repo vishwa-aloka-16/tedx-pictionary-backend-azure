@@ -7,6 +7,8 @@ from fastapi.responses import Response
 from .round_drawing import thumbnail_bytes
 from .config import CORS_ORIGINS
 from .admin_auth import admin_auth, require_admin
+from .leaderboard_gateway import LeaderboardUnavailable
+from fastapi.responses import JSONResponse
 
 from .tensorflow_model_service import get_model as warm_tensorflow_model
 
@@ -51,10 +53,11 @@ from .schemas import (
 async def lifespan(app: FastAPI):
     # Finish the 50-class model's cold start before accepting game requests.
     await asyncio.to_thread(warm_tensorflow_model)
+    delivery = asyncio.create_task(game_manager.leaderboard_delivery_loop())
     try:
         yield
     finally:
-        tasks = list(game_manager.disconnect_tasks.values()) + list(game_manager.connection_tasks)
+        tasks = [delivery] + list(game_manager.disconnect_tasks.values()) + list(game_manager.connection_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -65,6 +68,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(LeaderboardUnavailable)
+async def leaderboard_unavailable(_request, error):
+    return JSONResponse(status_code=503, content={"detail": str(error)})
 
 
 app.add_middleware(
@@ -184,6 +192,11 @@ async def predict(
 # Player enters their name.
 # The backend automatically creates or
 # finds a waiting two-player game.
+@app.post("/matchmaking/prepare")
+async def prepare_matchmaking():
+    return await game_manager.prepare_entry()
+
+
 @app.post("/matchmaking/join")
 async def join_matchmaking(
     request: MatchmakingRequest,
@@ -375,7 +388,11 @@ async def leaderboard_websocket(websocket: WebSocket):
     game_manager.leaderboard_subscribers.add(updates)
     try:
         while True:
-            rows = await asyncio.to_thread(game_manager.leaderboard_rows)
+            try:
+                rows = await asyncio.to_thread(game_manager.leaderboard_rows)
+            except LeaderboardUnavailable:
+                await websocket.close(code=1013, reason="Leaderboard storage is starting. Please reconnect.")
+                return
             snapshot = game_manager.leaderboard(rows)
             await websocket.send_json(snapshot)
             try:

@@ -90,3 +90,12 @@ alongside the backend; older Admin clients will receive 401 responses.
 This shared Admin password does not introduce company SSO, player authentication,
 durable game recovery, or persistence of Admin settings. Those are separate
 production requirements.
+
+## Remote leaderboard storage
+
+The existing `ARTWORK_SHARE_URL` now also enables leaderboard persistence through
+the Node service. Its existing upload key authenticates the game-data API; no
+PyMongo or new Node environment variables are needed. Deploy Node first, Python
+second, and the frontend last. Keep `LEADERBOARD_PATH` on persistent `/home/data`
+storage for pending-save replay. See [LEADERBOARD_SERVICE.md](LEADERBOARD_SERVICE.md)
+for readiness at player entry, generation-safe resets, and optional SQLite import.

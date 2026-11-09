@@ -81,3 +81,20 @@ See [queue/reconnect QA notes](docs/QUEUE_AND_RECONNECT_QA.md),
 [user flows](docs/HIGH_LEVEL_USER_FLOWS.md),
 [scoring rules](docs/QA_SCORING_AND_RULES.md) and
 [URLs/endpoints](docs/QA_ENDPOINTS_AND_URLS.md).
+
+## MongoDB leaderboard through the existing Node service
+
+The existing Node/QR service now stores completed game results and player emojis
+in MongoDB. Python uses HTTPS through `ARTWORK_SHARE_URL` and the existing
+`ARTWORK_SHARE_UPLOAD_KEY`; no PyMongo or new Node environment variables are
+needed. With that URL configured, SQLite is the delivery outbox rather than the
+leaderboard source. Keep `LEADERBOARD_PATH=/home/data/leaderboard.sqlite3` in Azure
+so pending submissions survive restarts. With the URL blank, local SQLite mode
+remains available.
+
+Registration prepares both services before joining. Final results show a pending
+global ranking until the remote save is confirmed. Duplicate delivery and resets
+are generation-safe. Deploy the updated Node service first, then Python, then the
+frontend. Existing local SQLite scores are not uploaded automatically.
+
+See the [deployment and optional import guide](backend/LEADERBOARD_SERVICE.md).

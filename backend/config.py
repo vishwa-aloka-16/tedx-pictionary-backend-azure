@@ -15,7 +15,8 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-LEADERBOARD_PATH = Path(os.getenv("LEADERBOARD_PATH", "leaderboard.sqlite3"))
+default_leaderboard_path = "/home/data/leaderboard.sqlite3" if os.name != "nt" and os.getenv("WEBSITE_INSTANCE_ID") else "leaderboard.sqlite3"
+LEADERBOARD_PATH = Path(os.getenv("LEADERBOARD_PATH", default_leaderboard_path))
 if not LEADERBOARD_PATH.is_absolute():
     LEADERBOARD_PATH = BACKEND_DIR / LEADERBOARD_PATH
 
