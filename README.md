@@ -62,3 +62,22 @@ Free-tier deployment is a trial, not a guarantee of sufficient gameplay capacity
 
 See [backend/DEPLOYMENT.md](backend/DEPLOYMENT.md) for dependency maintenance and
 Admin-session behavior. All artwork resources resolve within `backend/assets`.
+
+## Two-seat queue and reconnect
+
+Only two player seats can be occupied system-wide. Additional players wait in a
+FIFO queue and are admitted automatically when a seat is released. On a detected
+disconnect, active gameplay pauses and the seat is reserved for 15 seconds.
+Both players reconnect through a three-second countdown, retaining the same
+round, points and remaining time. On expiry, the unfinished match is cancelled
+and the remaining player returns to waiting.
+
+Deploy the updated backend and frontend together. Keep one backend worker and
+one instance; queue and active game state live in memory. The backend was
+previously deployed manually: pushing this repository alone does not deploy it
+unless you have since connected an Azure deployment workflow.
+
+See [queue/reconnect QA notes](docs/QUEUE_AND_RECONNECT_QA.md),
+[user flows](docs/HIGH_LEVEL_USER_FLOWS.md),
+[scoring rules](docs/QA_SCORING_AND_RULES.md) and
+[URLs/endpoints](docs/QA_ENDPOINTS_AND_URLS.md).

@@ -40,6 +40,11 @@ def rounds(count=6):
 
 
 class ArtworkTests(unittest.TestCase):
+    def setUp(self):
+        sharing = patch('backend.artwork.ARTWORK_SHARE_URL', '')
+        sharing.start()
+        self.addCleanup(sharing.stop)
+
     def test_saved_emoji_signature_is_monochrome_and_supported_for_all_avatars(self):
         glyphs = set()
         for emoji in PLAYER_EMOJIS:
@@ -163,6 +168,11 @@ class ArtworkTests(unittest.TestCase):
 
 
 class ArtworkGameTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        sharing = patch('backend.artwork.ARTWORK_SHARE_URL', '')
+        sharing.start()
+        self.addCleanup(sharing.stop)
+
     async def test_artwork_survives_rematch_and_preserves_original_names(self):
         with patch.object(GameManager, "initialize_leaderboard"):
             manager = GameManager(["cat", "dog"], {"test": ["cat", "dog"]})

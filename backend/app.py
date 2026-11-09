@@ -51,7 +51,13 @@ from .schemas import (
 async def lifespan(app: FastAPI):
     # Finish the 50-class model's cold start before accepting game requests.
     await asyncio.to_thread(warm_tensorflow_model)
-    yield
+    try:
+        yield
+    finally:
+        tasks = list(game_manager.disconnect_tasks.values()) + list(game_manager.connection_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(
@@ -189,6 +195,9 @@ async def join_matchmaking(
         )
     )
 
+    if game is None:
+        return await game_manager.queue_status(player.id)
+
     return {
         "player_id": player.id,
 
@@ -196,6 +205,16 @@ async def join_matchmaking(
             game
         ),
     }
+
+
+@app.get("/matchmaking/queue/{queue_id}")
+async def queue_status(queue_id: str):
+    return await game_manager.queue_status(queue_id)
+
+
+@app.post("/matchmaking/queue/{queue_id}/leave")
+async def leave_queue(queue_id: str):
+    return await game_manager.cancel_queue(queue_id)
 
 
 @app.get("/games/{game_id}")
@@ -396,17 +415,26 @@ async def game_websocket(
 
     await websocket.accept()
 
-    await game_manager.connect_websocket(
-        game=game,
-        player_id=player_id,
-        websocket=websocket,
-    )
+    try:
+        connected = await game_manager.connect_websocket(
+            game=game,
+            player_id=player_id,
+            websocket=websocket,
+        )
+    except HTTPException:
+        await websocket.close(code=4403)
+        return
+    if not connected:
+        return
 
     try:
         while True:
             # Receives the frontend's
             # WebSocket heartbeat.
-            await asyncio.wait_for(websocket.receive_text(), timeout=45)
+            message = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+            if message == "away":
+                await websocket.close(code=1001)
+                break
 
     except WebSocketDisconnect:
         pass

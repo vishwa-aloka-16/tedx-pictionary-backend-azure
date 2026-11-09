@@ -17,12 +17,16 @@ from backend.round_drawing import thumbnail_bytes
 
 class PromptSelectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        sharing = patch('backend.artwork.ARTWORK_SHARE_URL', '')
+        sharing.start()
+        self.addCleanup(sharing.stop)
         with patch.object(GameManager, "initialize_leaderboard"):
             self.manager = GameManager(
                 ["cat", "dog", "tree", "sun", "car"],
                 {"test": ["cat", "dog", "tree", "sun", "car"]},
             )
         self.manager.broadcast = AsyncMock()
+        self.manager.player_emoji = Mock(return_value="avatar")
         self.manager.record_leaderboard = Mock()
         self.manager.end_round_on_timeout = AsyncMock()
         self.manager.start_countdown = AsyncMock()
@@ -37,7 +41,8 @@ class PromptSelectionTests(unittest.IsolatedAsyncioTestCase):
     def create_game(self, classes):
         # Existing gameplay scenarios explicitly retain their original settings.
         game = Game(id="test-game", classes=classes, round_seconds=90,
-                    required_hits=3, confidence_threshold=0.4)
+                    required_hits=3, confidence_threshold=0.4,
+                    cosmetic_draw_seconds_by_round=[4] * 6)
         game.players = {
             "one": Player(id="one", name="One", seat=1),
             "two": Player(id="two", name="Two", seat=2),
@@ -206,9 +211,9 @@ class PromptSelectionTests(unittest.IsolatedAsyncioTestCase):
                              ["easy", "easy", "medium", "medium", "hard", "hard"])
             await self.manager.restart_game(game.id, "one")
 
-    def test_prediction_gap_defaults_to_point_two_seconds(self):
-        self.assertEqual(self.manager.admin_state()["prediction_gap_seconds"], 0.2)
-        self.assertEqual(Game(id="default").prediction_gap_seconds, 0.2)
+    def test_prediction_gap_defaults_to_point_one_seconds(self):
+        self.assertEqual(self.manager.admin_state()["prediction_gap_seconds"], 0.1)
+        self.assertEqual(Game(id="default").prediction_gap_seconds, 0.1)
 
     async def test_admin_validation_and_new_game_snapshot(self):
         classes = ["apple", "banana", "cat", "car", "bicycle", "guitar"]
@@ -469,17 +474,18 @@ class PromptSelectionTests(unittest.IsolatedAsyncioTestCase):
         classes = metadata["classes"]["class_names"]
         with patch.object(GameManager, "initialize_leaderboard"):
             manager = GameManager(classes, {"tensorflow_50": classes})
+        manager.player_emoji = Mock(return_value="avatar")
         state = manager.admin_state()
         self.assertEqual(state["model_key"], "tensorflow_50")
         self.assertEqual(state["round_seconds"], 40)
-        self.assertEqual(state["prediction_gap_seconds"], 0.2)
-        self.assertEqual(state["required_hits"], 2)
-        self.assertEqual(state["confidence_threshold"], 0.3)
+        self.assertEqual(state["prediction_gap_seconds"], 0.1)
+        self.assertEqual(state["required_hits"], 3)
+        self.assertEqual(state["confidence_threshold"], 0.6)
         self.assertEqual({item["name"] for item in state["classes"] if not item["enabled"]},
-                         {"helicopter", "bus", "broccoli", "giraffe"})
+                         {"helicopter", "bus", "broccoli", "giraffe", "grapes"})
         game, _ = await manager.join_matchmaking("One")
-        self.assertEqual(len(game.classes), 46)
-        self.assertEqual((game.round_seconds, game.required_hits, game.confidence_threshold), (40, 2, 0.3))
+        self.assertEqual(len(game.classes), 45)
+        self.assertEqual((game.round_seconds, game.required_hits, game.confidence_threshold), (40, 3, 0.6))
         for level in ("easy", "medium", "hard"):
             self.assertGreaterEqual(sum(game.class_difficulties[name] == level for name in game.classes), 2)
 

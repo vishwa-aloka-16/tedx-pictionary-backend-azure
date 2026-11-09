@@ -11,6 +11,9 @@ from backend.schemas import AdminSettingsRequest
 
 class CosmeticSettingsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        sharing = patch('backend.artwork.ARTWORK_SHARE_URL', '')
+        sharing.start()
+        self.addCleanup(sharing.stop)
         self.classes = ['a', 'b', 'c', 'd', 'e', 'f']
         self.difficulties = dict(zip(self.classes, ['easy', 'easy', 'medium', 'medium', 'hard', 'hard']))
         with patch.object(GameManager, 'initialize_leaderboard'):

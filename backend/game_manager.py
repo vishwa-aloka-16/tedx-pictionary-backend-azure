@@ -23,6 +23,8 @@ from fastapi import (
 
 MAX_PLAYERS = 2
 DISCONNECT_GRACE_SECONDS = 15
+QUEUE_TTL_SECONDS = 45
+MAX_QUEUE_SIZE = 200
 PLAYER_EMOJIS = ["\U0001f98a", "\U0001f43c", "\U0001f428", "\U0001f431", "\U0001f436",
                  "\U0001f438", "\U0001f981", "\U0001f42f", "\U0001f984", "\U0001f419",
                  "\U0001f989", "\U0001f427", "\U0001f435", "\U0001f430", "\U0001f43b",
@@ -58,6 +60,8 @@ class Player:
     seat: int
     client_id: str | None = None
     emoji: str | None = None
+    connected: bool = False
+    disconnected_until: float | None = None
 
     ready: bool = False
 
@@ -90,6 +94,11 @@ class Game:
     cosmetic_draw_seconds_by_round: list[float] = field(default_factory=lambda: list(DEFAULT_COSMETIC_DRAW_SECONDS_BY_ROUND))
 
     phase: str = "WAITING"
+    paused_phase: str | None = None
+    paused_at: float | None = None
+    paused_remaining_seconds: float | None = None
+    result_transition_at: float | None = None
+    cancellation_message: str = ""
 
     players: dict[
         str,
@@ -136,6 +145,15 @@ class Game:
         return min(MAX_ROUNDS, len(set(self.classes)))
 
 
+@dataclass
+class QueueEntry:
+    id: str
+    name: str
+    model_key: str
+    client_id: str | None
+    last_seen: float = field(default_factory=time.time)
+
+
 class GameManager:
     def __init__(
         self,
@@ -164,6 +182,9 @@ class GameManager:
         self.dashboard_reset_at = 0.0
         self.leaderboard_subscribers: set[asyncio.Queue] = set()
         self.disconnect_tasks = {}
+        self.waiting_queue: OrderedDict[str, QueueEntry] = OrderedDict()
+        self.queue_assignments: dict[str, tuple[str, str]] = {}
+        self.connection_tasks: set[asyncio.Task] = set()
         # Cosmetic thumbnails only. Bounded RAM cache, never part of SQLite.
         self.round_drawings: OrderedDict[str, bytes] = OrderedDict()
         self.artworks = ArtworkStore()
@@ -355,10 +376,10 @@ class GameManager:
                         if result["event_id"] in self.round_drawings else None
                     )}
                     for result in game.round_winners
-                    if self.round_result_visible(result, now)
+                    if self.round_result_visible(result, game.paused_at if game.paused_phase == "ROUND_RESULT" else now)
                 ],
                 "game_result": self.game_result(game) if all(
-                    self.round_result_visible(result, now) for result in game.round_winners
+                    self.round_result_visible(result, game.paused_at if game.paused_phase == "ROUND_RESULT" else now) for result in game.round_winners
                 ) else None,
             }
             for game in self.games.values()
@@ -620,6 +641,11 @@ class GameManager:
             "server_time": time.time(),
             "model_key": game.model_key,
             "phase": game.phase,
+            "resume_phase": game.paused_phase,
+            "paused_remaining_seconds": game.paused_remaining_seconds,
+            "reconnect_deadline": min((p.disconnected_until for p in game.players.values()
+                                       if p.disconnected_until is not None), default=None),
+            "cancellation_message": game.cancellation_message,
 
             "round_number": (
                 game.round_number
@@ -668,6 +694,7 @@ class GameManager:
                     "emoji": player.emoji,
                     "seat": player.seat,
                     "ready": player.ready,
+                    "connected": player.connected,
 
                     "score": player.score,
 
@@ -737,75 +764,84 @@ class GameManager:
         await asyncio.gather(*(send(connection) for connection in
                                list(self.connections.get(game.id, []))))
 
-    async def connect_websocket(
-        self,
-        game: Game,
-        player_id: str,
-        websocket: WebSocket,
-    ):
-        task = self.disconnect_tasks.pop((game.id, player_id), None)
-        if task:
-            task.cancel()
-        self.connections.setdefault(
-            game.id,
-            [],
-        ).append(
-            (
-                websocket,
-                player_id,
-            )
-        )
+    def track_connection_task(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.connection_tasks.add(task)
+        task.add_done_callback(self.connection_tasks.discard)
+        return task
 
-        await websocket.send_json(
-            {
-                "type": "game_state",
-                "game": (
-                    self.public_state(game)
-                ),
-            }
-        )
+    def pause_game(self, game):
+        if game.phase not in {"COUNTDOWN", "DRAWING", "ROUND_RESULT", "RESUMING"}:
+            return
+        if game.phase != "RESUMING":
+            game.paused_phase = game.phase
+            game.paused_at = time.time()
+            game.paused_remaining_seconds = max(0, (game.round_deadline or game.paused_at) - game.paused_at)
+        game.phase = "PAUSED"
+        game.transition_token += 1
+        game.countdown_ends_at = None
 
-    def disconnect_websocket(
-        self,
-        game_id: str,
-        websocket: WebSocket,
-    ):
-        current_connections = (
-            self.connections.get(
-                game_id,
-                [],
-            )
-        )
+    async def connect_websocket(self, game, player_id, websocket):
+        player = self.get_player(game, player_id)
+        if player.disconnected_until is not None and time.time() >= player.disconnected_until:
+            await self.leave_game(game.id, player_id, disconnected=True)
+            await websocket.close(code=4403)
+            return False
+        lock = self.game_locks.get(game.id)
+        if lock is None:
+            await websocket.close(code=4403)
+            return False
+        async with lock:
+            self.get_player(game, player_id)
+            if player.disconnected_until is not None and time.time() >= player.disconnected_until:
+                await websocket.close(code=4403)
+                return False
+            task = self.disconnect_tasks.pop((game.id, player_id), None)
+            if task:
+                task.cancel()
+            self.connections.setdefault(game.id, []).append((websocket, player_id))
+            player.connected = True
+            player.disconnected_until = None
+            if game.phase == "PAUSED" and len(game.players) == MAX_PLAYERS and all(p.connected for p in game.players.values()):
+                game.phase = "RESUMING"
+                game.countdown_ends_at = time.time() + COUNTDOWN_SECONDS
+                game.transition_token += 1
+                self.track_connection_task(self.resume_after_countdown(game.id, game.transition_token))
+            elif game.phase in {"WAITING", "LOBBY"} and len(game.players) == MAX_PLAYERS and all(p.connected and p.ready for p in game.players.values()):
+                await self.start_countdown(game)
+            await self.broadcast(game)
+            return True
 
-        self.connections[game_id] = [
-            (
-                connected_socket,
-                player_id,
-            )
-            for (
-                connected_socket,
-                player_id,
-            )
-            in current_connections
-            if (
-                connected_socket
-                is not websocket
-            )
-        ]
-        for _, player_id in current_connections:
-            if not any(pid == player_id for _, pid in self.connections.get(game_id, [])):
+    def disconnect_websocket(self, game_id, websocket):
+        game = self.games.get(game_id)
+        if game is None:
+            self.connections.pop(game_id, None)
+            return
+        connections = self.connections.get(game_id, [])
+        affected = {pid for socket, pid in connections if socket is websocket}
+        self.connections[game_id] = [(socket, pid) for socket, pid in connections if socket is not websocket]
+        for player_id in affected:
+            if not any(pid == player_id for _, pid in self.connections.get(game_id, [])) and player_id in game.players:
+                game.players[player_id].connected = False
                 self.schedule_disconnect_cleanup(game_id, player_id)
+                self.pause_game(game)
+        if affected:
+            self.track_connection_task(self.broadcast(game))
 
     def schedule_disconnect_cleanup(self, game_id, player_id):
         key = (game_id, player_id)
         if key in self.disconnect_tasks or game_id not in self.games:
             return
+        player = self.games[game_id].players.get(player_id)
+        if player is None:
+            return
+        player.disconnected_until = time.time() + DISCONNECT_GRACE_SECONDS
 
         async def expire():
             try:
-                await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
+                await asyncio.sleep(max(0, player.disconnected_until - time.time()) if player.disconnected_until else 0)
                 if not any(pid == player_id for _, pid in self.connections.get(game_id, [])):
-                    await self.leave_game(game_id, player_id)
+                    await self.leave_game(game_id, player_id, disconnected=True)
             except HTTPException:
                 pass
             finally:
@@ -814,124 +850,216 @@ class GameManager:
 
         self.disconnect_tasks[key] = asyncio.create_task(expire())
 
-    async def join_matchmaking(
-        self,
-        name: str,
-        model_key: str | None = None,
-        client_id: str | None = None,
-    ) -> tuple[Game, Player]:
-        player_name = self.clean_name(
-            name
-        )
+    async def resume_after_countdown(self, game_id, token):
+        game = self.games.get(game_id)
+        if game is None:
+            return
+        await asyncio.sleep(max(0, (game.countdown_ends_at or time.time()) - time.time()))
+        lock = self.game_locks.get(game_id)
+        if lock is None:
+            return
+        async with lock:
+            if game.phase != "RESUMING" or game.transition_token != token:
+                return
+            if not all(p.connected for p in game.players.values()):
+                self.pause_game(game)
+                return
+            delta = time.time() - (game.paused_at or time.time())
+            phase = game.paused_phase
+            game.phase = phase
+            game.countdown_ends_at = None
+            if game.round_started_at is not None:
+                game.round_started_at += delta
+            if game.round_deadline is not None:
+                game.round_deadline += delta
+            if game.result_transition_at is not None:
+                game.result_transition_at += delta
+            if phase == "ROUND_RESULT" and game.round_winners:
+                for field_name in ("reveal_after", "drawing_deadline"):
+                    game.round_winners[-1][field_name] += delta
+            game.paused_phase = None
+            game.paused_at = None
+            game.paused_remaining_seconds = None
+            game.transition_token += 1
+            token = game.transition_token
+            if phase == "COUNTDOWN":
+                game.countdown_ends_at = time.time() + PROMPT_DELIVERY_LEAD_SECONDS
+                self.track_connection_task(self.begin_round_after_countdown(game.id, token))
+            elif phase == "DRAWING":
+                self.track_connection_task(self.end_round_on_timeout(game.id, token))
+            elif phase == "ROUND_RESULT":
+                self.track_connection_task(self.advance_after_result(game.id, token))
+            await self.broadcast(game)
 
+    def prune_queue(self):
+        now = time.time()
+        for key, entry in list(self.waiting_queue.items()):
+            if now - entry.last_seen >= QUEUE_TTL_SECONDS:
+                self.waiting_queue.pop(key, None)
+
+    def occupied_seats(self):
+        return sum(len(game.players) for game in self.games.values())
+
+    async def promote_queue_locked(self):
+        self.prune_queue()
+        while self.waiting_queue and self.occupied_seats() < MAX_PLAYERS:
+            key, entry = next(iter(self.waiting_queue.items()))
+            game, player = await self.seat_player_locked(entry.name, entry.model_key, entry.client_id)
+            self.waiting_queue.pop(key, None)
+            self.queue_assignments[key] = (game.id, player.id)
+
+    async def join_matchmaking(self, name, model_key=None, client_id=None):
+        player_name = self.clean_name(name)
         model_key = model_key or self.model_key
-
         if model_key not in self.classes_by_model:
-            raise HTTPException(
-                status_code=400,
-                detail="Please choose a supported AI model.",
-            )
-
+            raise HTTPException(400, "Please choose a supported AI model.")
         async with self.matchmaking_lock:
+            self.prune_queue()
             for existing in self.games.values():
                 for occupant in existing.players.values():
                     if client_id and occupant.client_id == client_id:
                         return existing, occupant
                     if occupant.name.casefold() == player_name.casefold():
                         raise HTTPException(409, "This username already has an active session. Reconnect or wait a few seconds after leaving.")
-            waiting_game = None
-            emoji = self.player_emoji(player_name)
+            for entry in self.waiting_queue.values():
+                if client_id and entry.client_id == client_id:
+                    entry.last_seen = time.time()
+                    return None, entry
+                if entry.name.casefold() == player_name.casefold():
+                    raise HTTPException(409, "This username is already waiting in the queue.")
+            await self.promote_queue_locked()
+            if self.occupied_seats() >= MAX_PLAYERS or self.waiting_queue:
+                if len(self.waiting_queue) >= MAX_QUEUE_SIZE:
+                    raise HTTPException(409, "The waiting queue is full. Please try again later.")
+                entry = QueueEntry(secrets.token_urlsafe(24), player_name, model_key, client_id)
+                self.waiting_queue[entry.id] = entry
+                return None, entry
+            return await self.seat_player_locked(player_name, model_key, client_id)
 
-            for existing_game in (
-                self.games.values()
+    async def queue_status(self, queue_id):
+        async with self.matchmaking_lock:
+            self.prune_queue()
+            entry = self.waiting_queue.get(queue_id)
+            if entry:
+                entry.last_seen = time.time()
+            await self.promote_queue_locked()
+            assigned = self.queue_assignments.get(queue_id)
+            if assigned:
+                game = self.games.get(assigned[0])
+                if game and assigned[1] in game.players:
+                    return {"queued": False, "player_id": assigned[1], "game": self.public_state(game)}
+                self.queue_assignments.pop(queue_id, None)
+            if queue_id not in self.waiting_queue:
+                raise HTTPException(404, "Your queue session has expired. Please join again.")
+            return {"queued": True, "queue_id": queue_id,
+                    "position": list(self.waiting_queue).index(queue_id) + 1,
+                    "message": "Game in progress\u2014please wait."}
+
+    async def cancel_queue(self, queue_id):
+        async with self.matchmaking_lock:
+            self.waiting_queue.pop(queue_id, None)
+            assigned = self.queue_assignments.pop(queue_id, None)
+        if assigned and assigned[0] in self.games and assigned[1] in self.games[assigned[0]].players:
+            await self.leave_game(*assigned)
+        return {"status": "left"}
+
+    async def seat_player_locked(self, player_name, model_key, client_id):
+        if self.occupied_seats() >= MAX_PLAYERS:
+            raise HTTPException(409, "Game in progress\u2014please wait.")
+        waiting_game = None
+        emoji = self.player_emoji(player_name)
+
+        for existing_game in (
+            self.games.values()
+        ):
+            if (
+                existing_game.phase
+                == "WAITING"
+                and existing_game.model_key
+                == model_key
+                and len(
+                    existing_game.players
+                )
+                == 1
             ):
-                if (
-                    existing_game.phase
-                    == "WAITING"
-                    and existing_game.model_key
-                    == model_key
-                    and len(
-                        existing_game.players
-                    )
-                    == 1
-                ):
-                    waiting_game = (
-                        existing_game
-                    )
-                    break
-
-            if waiting_game:
-                player = Player(
-                    id=(
-                        self
-                        .create_player_id()
-                    ),
-                    name=player_name,
-                    seat=2,
-                    client_id=client_id,
-                    emoji=emoji,
+                waiting_game = (
+                    existing_game
                 )
+                break
 
-                waiting_game.players[
-                    player.id
-                ] = player
-
-                waiting_game.phase = "LOBBY"
-                self.schedule_disconnect_cleanup(waiting_game.id, player.id)
-
-                await self.broadcast(
-                    waiting_game
-                )
-
-                return (
-                    waiting_game,
-                    player,
-                )
-
-            game = Game(
-                id=self.create_game_id(),
-                model_key=model_key,
-                classes=[
-                    item
-                    for item in self.classes_by_model[model_key]
-                    if item not in self.excluded_classes
-                ],
-                round_seconds=self.round_seconds,
-                cosmetic_draw_seconds_by_round=list(self.cosmetic_draw_seconds_by_round),
-                prediction_gap_seconds=self.prediction_gap_seconds,
-                required_hits=self.required_hits,
-                confidence_threshold=self.confidence_threshold,
-                class_difficulties=self.difficulties_by_model[model_key].copy(),
-            )
-
-            if not game.classes:
-                raise HTTPException(
-                    status_code=400,
-                    detail="At least one class must remain enabled.",
-                )
-
+        if waiting_game:
             player = Player(
-                id=self.create_player_id(),
+                id=(
+                    self
+                    .create_player_id()
+                ),
                 name=player_name,
-                seat=1,
+                seat=2,
                 client_id=client_id,
                 emoji=emoji,
             )
 
-            game.players[player.id] = (
-                player
+            waiting_game.players[
+                player.id
+            ] = player
+
+            waiting_game.phase = "LOBBY"
+            self.schedule_disconnect_cleanup(waiting_game.id, player.id)
+
+            await self.broadcast(
+                waiting_game
             )
 
-            self.games[game.id] = game
-
-            self.game_locks[game.id] = (
-                asyncio.Lock()
+            return (
+                waiting_game,
+                player,
             )
 
-            self.connections[game.id] = []
-            self.schedule_disconnect_cleanup(game.id, player.id)
+        game = Game(
+            id=self.create_game_id(),
+            model_key=model_key,
+            classes=[
+                item
+                for item in self.classes_by_model[model_key]
+                if item not in self.excluded_classes
+            ],
+            round_seconds=self.round_seconds,
+            cosmetic_draw_seconds_by_round=list(self.cosmetic_draw_seconds_by_round),
+            prediction_gap_seconds=self.prediction_gap_seconds,
+            required_hits=self.required_hits,
+            confidence_threshold=self.confidence_threshold,
+            class_difficulties=self.difficulties_by_model[model_key].copy(),
+        )
 
-            return game, player
+        if not game.classes:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one class must remain enabled.",
+            )
+
+        player = Player(
+            id=self.create_player_id(),
+            name=player_name,
+            seat=1,
+            client_id=client_id,
+            emoji=emoji,
+        )
+
+        game.players[player.id] = (
+            player
+        )
+
+        self.games[game.id] = game
+
+        self.game_locks[game.id] = (
+            asyncio.Lock()
+        )
+
+        self.connections[game.id] = []
+        self.schedule_disconnect_cleanup(game.id, player.id)
+
+        return game, player
+
 
     async def mark_ready(
         self,
@@ -969,6 +1097,7 @@ class GameManager:
                 == MAX_PLAYERS
                 and all(
                     current_player.ready
+                    and current_player.connected
                     for current_player
                     in game.players.values()
                 )
@@ -987,6 +1116,7 @@ class GameManager:
         self,
         game: Game,
     ):
+        game.cancellation_message = ""
         # A waiting room may predate an Admin save. Apply the latest cosmetic
         # values once at match start, then keep them fixed for its six rounds.
         if game.round_number == 0:
@@ -1099,6 +1229,7 @@ class GameManager:
 
             game.round_winner_id = None
             game.round_points = 0
+            game.result_transition_at = None
 
             for player in (
                 game.players.values()
@@ -1327,6 +1458,8 @@ class GameManager:
         winner: Player | None,
     ):
         current_time = time.time()
+        game.result_transition_at = current_time + max(ROUND_RESULT_SECONDS,
+            self.cosmetic_draw_seconds(game) + DRAWING_UPLOAD_GRACE_SECONDS)
 
         game.phase = "ROUND_RESULT"
 
@@ -1436,8 +1569,9 @@ class GameManager:
         current_game = self.games.get(game_id)
         if current_game is None:
             return
-        await asyncio.sleep(max(ROUND_RESULT_SECONDS,
-                                self.cosmetic_draw_seconds(current_game) + DRAWING_UPLOAD_GRACE_SECONDS))
+        await asyncio.sleep(max(0, current_game.result_transition_at - time.time())
+                            if current_game.result_transition_at is not None else
+                            max(ROUND_RESULT_SECONDS, self.cosmetic_draw_seconds(current_game) + DRAWING_UPLOAD_GRACE_SECONDS))
 
         game = self.games.get(game_id)
 
@@ -1547,6 +1681,7 @@ class GameManager:
         self,
         game_id: str,
         player_id: str,
+        disconnected: bool = False,
     ):
         game = self.get_game(game_id)
 
@@ -1561,12 +1696,16 @@ class GameManager:
                     player_id,
                 )
 
-                if game.phase == "FINAL_RESULT":
+                completed = game.phase == "FINAL_RESULT"
+                if completed:
                     self.capture_artwork(game, complete=True)
                 game.players.pop(
                     player_id,
                     None,
                 )
+                for key, assignment in list(self.queue_assignments.items()):
+                    if assignment == (game_id, player_id):
+                        self.queue_assignments.pop(key, None)
                 task = self.disconnect_tasks.pop((game_id, player_id), None)
                 if task and task is not asyncio.current_task():
                     task.cancel()
@@ -1621,7 +1760,7 @@ class GameManager:
                         game.id,
                         None,
                     )
-
+                    await self.promote_queue_locked()
                     return
 
                 remaining_player = next(
@@ -1641,6 +1780,13 @@ class GameManager:
 
                 game.artwork_id = secrets.token_urlsafe(24)
                 game.phase = "WAITING"
+                game.paused_phase = None
+                game.paused_at = None
+                game.paused_remaining_seconds = None
+                game.result_transition_at = None
+                game.global_rankings = {}
+                game.cancellation_message = ("The match was cancelled because your opponent did not reconnect. Waiting for an opponent."
+                                             if disconnected and not completed else "Your opponent left. Waiting for an opponent.")
                 game.round_number = 0
 
                 game.prompt = ""
@@ -1657,3 +1803,4 @@ class GameManager:
                 game.round_points = 0
 
                 await self.broadcast(game)
+                await self.promote_queue_locked()
