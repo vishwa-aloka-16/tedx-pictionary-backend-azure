@@ -54,10 +54,11 @@ async def lifespan(app: FastAPI):
     # Finish the 50-class model's cold start before accepting game requests.
     await asyncio.to_thread(warm_tensorflow_model)
     delivery = asyncio.create_task(game_manager.leaderboard_delivery_loop())
+    settings_restore = asyncio.create_task(game_manager.restore_admin_settings_loop())
     try:
         yield
     finally:
-        tasks = [delivery] + list(game_manager.disconnect_tasks.values()) + list(game_manager.connection_tasks)
+        tasks = [delivery, settings_restore] + list(game_manager.disconnect_tasks.values()) + list(game_manager.connection_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -140,6 +141,7 @@ def admin_logout(token: str = Depends(require_admin)):
 
 @app.get("/admin", dependencies=[Depends(require_admin)])
 def admin_settings():
+    game_manager.ensure_admin_settings()
     return {
         "models": get_available_models(game_manager.difficulties_by_model),
         "settings": game_manager.admin_state(),

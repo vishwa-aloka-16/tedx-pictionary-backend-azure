@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import logging
 import time
+import threading
 from dataclasses import (
     dataclass,
     field,
@@ -183,6 +184,8 @@ class GameManager:
             for key, classes in self.classes_by_model.items()
         }
         self.dashboard_reset_at = 0.0
+        self.admin_settings_lock = threading.RLock()
+        self.admin_settings_loaded = False
         self.leaderboard_subscribers: set[asyncio.Queue] = set()
         self.disconnect_tasks = {}
         self.waiting_queue: OrderedDict[str, QueueEntry] = OrderedDict()
@@ -257,7 +260,35 @@ class GameManager:
         gateway = getattr(self, 'leaderboard_gateway', None)
         if gateway:
             await asyncio.to_thread(gateway.prepare)
+        await asyncio.to_thread(self.ensure_admin_settings)
         return {"status": "ok"}
+
+    def ensure_admin_settings(self):
+        with self.admin_settings_lock:
+            gateway = getattr(self, 'leaderboard_gateway', None)
+            if self.admin_settings_loaded or not gateway:
+                return
+            result = gateway.request('GET', '/game-data/settings', timeout=60)
+            if 'settings' not in result:
+                raise LeaderboardUnavailable('Invalid saved admin settings response.')
+            saved = result['settings']
+            if saved is not None:
+                try:
+                    from .schemas import AdminSettingsRequest
+                    validated = AdminSettingsRequest.model_validate(saved)
+                    self._update_admin_settings(**validated.model_dump(), persist=False)
+                except (ValueError, TypeError, HTTPException):
+                    raise LeaderboardUnavailable('Saved admin settings are invalid; please check game_admin_settings in MongoDB.') from None
+            self.admin_settings_loaded = True
+
+    async def restore_admin_settings_loop(self):
+        while True:
+            try:
+                await asyncio.to_thread(self.ensure_admin_settings)
+                return
+            except LeaderboardUnavailable:
+                logging.getLogger(__name__).warning('Admin settings restoration delayed; retrying.')
+                await asyncio.sleep(5)
 
     def apply_dashboard_reset(self):
         self.round_drawings.clear()
@@ -545,6 +576,13 @@ class GameManager:
         }
 
     def update_admin_settings(
+        self, *args, **kwargs,
+    ) -> dict[str, Any]:
+        with self.admin_settings_lock:
+            self.ensure_admin_settings()
+            return self._update_admin_settings(*args, **kwargs)
+
+    def _update_admin_settings(
         self,
         model_key: str,
         round_seconds: int,
@@ -554,6 +592,7 @@ class GameManager:
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
         prediction_gap_seconds: float = PREDICTION_GAP_SECONDS,
         cosmetic_draw_seconds_by_round: list[float] | None = None,
+        persist: bool = True,
     ) -> dict[str, Any]:
         if cosmetic_draw_seconds_by_round is not None and (
             len(cosmetic_draw_seconds_by_round) != MAX_ROUNDS or any(
@@ -607,6 +646,15 @@ class GameManager:
                    for name in classes) < 2:
                 raise HTTPException(status_code=400, detail=f"Enable at least two {level} classes for six unique rounds.")
 
+        gateway = getattr(self, 'leaderboard_gateway', None)
+        if persist and gateway:
+            settings = dict(model_key=model_key, round_seconds=round_seconds, excluded_classes=excluded_classes,
+                class_difficulties=difficulties, required_hits=required_hits, confidence_threshold=confidence_threshold,
+                prediction_gap_seconds=prediction_gap_seconds,
+                cosmetic_draw_seconds_by_round=list(cosmetic_draw_seconds_by_round if cosmetic_draw_seconds_by_round is not None else self.cosmetic_draw_seconds_by_round))
+            result = gateway.request('PUT', '/game-data/settings', {'settings': settings})
+            if result.get('status') != 'saved':
+                raise LeaderboardUnavailable('Admin settings could not be confirmed as saved. Please retry.')
         self.difficulties_by_model[model_key] = difficulties
         self.model_key = model_key
         self.round_seconds = round_seconds
@@ -979,6 +1027,7 @@ class GameManager:
             self.queue_assignments[key] = (game.id, player.id)
 
     async def join_matchmaking(self, name, model_key=None, client_id=None):
+        await asyncio.to_thread(self.ensure_admin_settings)
         player_name = self.clean_name(name)
         model_key = model_key or self.model_key
         if model_key not in self.classes_by_model:

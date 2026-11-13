@@ -25,7 +25,8 @@ class NoPyTorch(importlib.abc.MetaPathFinder):
         if fullname == "torch" or fullname.startswith("torch."):
             raise AssertionError("Backend attempted to import PyTorch")
 sys.meta_path.insert(0, NoPyTorch())
-from backend.app import app, health, admin_settings
+from backend.app import app, health, admin_settings, game_manager
+game_manager.ensure_admin_settings = lambda: None
 assert health()["model"]["number_of_classes"] == 50
 assert [model["key"] for model in admin_settings()["models"]] == ["tensorflow_50"]
 assert not any(name == "torch" or name.startswith("torch.") for name in sys.modules)

@@ -32,6 +32,8 @@ class FakeService:
             raise LeaderboardUnavailable()
         if path == '/game-data/health':
             return {'status': 'ok', 'generation': self.generation}
+        if path == '/game-data/settings':
+            return {'settings': None}
         if path == '/game-data/players/resolve':
             return {'name': payload['name'], 'emoji': 'fox', 'generation': self.generation}
         if path == '/game-data/leaderboard?limit=20':
@@ -246,7 +248,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         loop_thread = threading.get_ident()
         def prepare():
             self.assertNotEqual(loop_thread, threading.get_ident())
-        manager.leaderboard_gateway = Mock(prepare=prepare)
+        manager.leaderboard_gateway = Mock(prepare=prepare, request=Mock(return_value={'settings': None}))
         self.assertEqual(await manager.prepare_entry(), {'status': 'ok'})
 
     async def test_queue_promotion_uses_entry_profile_cache_during_storage_outage(self):

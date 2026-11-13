@@ -127,6 +127,25 @@ mixing a different import into populated history is refused. Profile collisions
 receive unused avatars. Imports are limited to 500 score/profile entries and a
 256 KB request body; a larger dataset needs a separate batch migration.
 
+## Admin settings persistence
+
+The Node service stores the latest gameplay configuration in MongoDB collection
+`game_admin_settings` (document `_id: "admin"`). Protected GET and PUT
+`/game-data/settings` reuse the existing upload key; no new environment variables
+or Python MongoDB driver are needed. Admin passwords and login tokens stay out of
+this document. Model, timer, confidence, stable guesses, prediction gap, excluded
+classes, class difficulties and hidden cosmetic durations are saved together.
+
+Deploy the updated Node service first, then Python. Python restores settings in a
+background startup task and also checks restoration before registration and admin
+access. A sleeping service is retried. New players cannot enter using accidental
+defaults while storage is unavailable. Existing games retain their snapshots.
+Admin changes apply only after remote save acknowledgement; failures return an
+error and keep the previous local configuration. On a new database without saved
+settings, existing defaults apply until the first successful admin save. Dashboard
+resets do not delete admin settings. Without ARTWORK_SHARE_URL, settings retain
+their previous memory-only local behavior.
+
 ## Verification
 
 Local tests cover retries, restart replay, lost acknowledgements, reset generations,

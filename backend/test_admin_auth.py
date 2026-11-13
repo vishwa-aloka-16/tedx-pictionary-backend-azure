@@ -87,6 +87,9 @@ class AdminRouteTests(unittest.IsolatedAsyncioTestCase):
         self.api_patch.start()
         self.addCleanup(self.auth_patch.stop)
         self.addCleanup(self.api_patch.stop)
+        settings_patch = patch.object(self.api.game_manager, 'ensure_admin_settings')
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
 
     async def test_all_settings_and_reset_routes_require_login(self):
         for method, path, data in [('GET', '/admin', None), ('PUT', '/admin', {}),
